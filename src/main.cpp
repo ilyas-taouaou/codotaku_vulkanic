@@ -6,6 +6,7 @@
 #include <SDL3/SDL_vulkan.h>
 #include <print>
 #include <vulkan/vulkan_raii.hpp>
+#include <cmath>
 
 class SDLException final : public std::runtime_error {
 public:
