@@ -14,7 +14,10 @@ best practices.
 Each livestream builds upon the previous one, progressively expanding the Vulkan implementation. Here is the list of
 livestreams:
 
-1. **[A Colored Window](https://www.youtube.com/watch?v=43sDPSSG0-U)** - Introduction to Vulkan-HPP RAII, setting up
+1. **[A Colored Window](https://www.youtube.com/watch?v=43sDPSSG0-U)**
+   ([branch](https://github.com/ilyas-taouaou/codotaku_vulkanic/tree/colored-window)) - Introduction to Vulkan-HPP
+   RAII,
+   setting up
    Vulkan with SDL3, and rendering a simple color using GPU memory transfer operations.
 
 Future livestreams will be added here as the project evolves.
