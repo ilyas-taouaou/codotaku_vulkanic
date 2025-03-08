@@ -16,6 +16,15 @@ public:
 
 constexpr auto VULKAN_VERSION{vk::makeApiVersion(0, 1, 4, 0)};
 
+struct Frame {
+    vk::raii::CommandBuffer commandBuffer;
+    vk::raii::Semaphore imageAvailableSemaphore;
+    vk::raii::Semaphore renderFinishedSemaphore;
+    vk::raii::Fence fence;
+};
+
+constexpr uint32_t IN_FLIGHT_FRAME_COUNT{2};
+
 class App {
     std::unique_ptr<SDL_Window, decltype(&SDL_DestroyWindow)> window{nullptr, SDL_DestroyWindow};
     bool running{true};
@@ -29,10 +38,8 @@ class App {
     std::optional<vk::raii::Queue> graphicsQueue{};
 
     std::optional<vk::raii::CommandPool> commandPool{};
-    std::vector<vk::raii::CommandBuffer> commandBuffers{};
-    std::vector<vk::raii::Semaphore> imageAvailableSemaphores{};
-    std::vector<vk::raii::Semaphore> renderFinishedSemaphores{};
-    std::vector<vk::raii::Fence> fences{};
+    std::array<std::optional<Frame>, IN_FLIGHT_FRAME_COUNT> frames{};
+    uint32_t frameIndex{};
 
     std::optional<vk::raii::SwapchainKHR> swapchain{};
     std::vector<vk::Image> swapchainImages{};
@@ -67,8 +74,7 @@ public:
         PickPhysicalDevice();
         InitDevice();
         InitCommandPool();
-        AllocateCommandBuffers();
-        InitSyncObjects();
+        InitFrames();
         RecreateSwapchain();
     }
 
@@ -81,18 +87,34 @@ public:
     }
 
 private:
-    void Render() {
-        vk::Fence const fence{*fences[0]};
-        auto _ = device->waitForFences(fence, VK_TRUE, UINT64_MAX);
-        device->resetFences(fence);
+    struct ImageLayout {
+        vk::ImageLayout imageLayout{};
+        vk::PipelineStageFlags2 stageMask{};
+        vk::AccessFlags2 accessMask{};
+        uint32_t queueFamilyIndex{VK_QUEUE_FAMILY_IGNORED};
+    };
 
-        auto [acquireResult, imageIndex] = swapchain->
-            acquireNextImage(UINT64_MAX, imageAvailableSemaphores[0], nullptr);
-        currentSwapchainImageIndex = imageIndex;
+    static void TransitionImageLayout(vk::raii::CommandBuffer const &commandBuffer, vk::Image const &image,
+                                      ImageLayout const &oldLayout, ImageLayout const &newLayout) {
+        vk::ImageMemoryBarrier2 const barrier{
+            oldLayout.stageMask,
+            oldLayout.accessMask,
+            newLayout.stageMask,
+            newLayout.accessMask,
+            oldLayout.imageLayout,
+            newLayout.imageLayout,
+            oldLayout.queueFamilyIndex,
+            newLayout.queueFamilyIndex,
+            image, vk::ImageSubresourceRange{
+                vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1
+            }
+        };
+        vk::DependencyInfo dependencyInfo{};
+        dependencyInfo.setImageMemoryBarriers(barrier);
+        commandBuffer.pipelineBarrier2(dependencyInfo);
+    }
 
-        auto const &swapchainImage{swapchainImages[imageIndex]};
-
-        vk::raii::CommandBuffer const &commandBuffer{commandBuffers[0]};
+    static void RecordCommandBuffer(vk::raii::CommandBuffer const &commandBuffer, vk::Image const &swapchainImage) {
         commandBuffer.reset();
         vk::CommandBufferBeginInfo beginInfo{};
         beginInfo.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -104,51 +126,73 @@ private:
             std::array{static_cast<float>(std::sin(t * 5.0) * 0.5 + 0.5), 0.0f, 0.0f, 1.0f}
         };
 
-        // transfer image layout to transfer destination
-        vk::ImageMemoryBarrier const barrier{
-            vk::AccessFlagBits::eMemoryRead, vk::AccessFlagBits::eTransferWrite,
-            vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            swapchainImage, vk::ImageSubresourceRange{
-                vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1
-            }
-        };
-        commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                                      vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags{}, nullptr, nullptr,
-                                      barrier);
+        TransitionImageLayout(commandBuffer, swapchainImage,
+                              ImageLayout{
+                                  vk::ImageLayout::eUndefined,
+                                  vk::PipelineStageFlagBits2::eTransfer,
+                                  vk::AccessFlagBits2KHR::eMemoryRead,
+                              },
+                              ImageLayout{
+                                  vk::ImageLayout::eTransferDstOptimal,
+                                  vk::PipelineStageFlagBits2::eTransfer,
+                                  vk::AccessFlagBits2KHR::eTransferWrite,
+                              });
 
         commandBuffer.clearColorImage(swapchainImage, vk::ImageLayout::eTransferDstOptimal, color,
                                       vk::ImageSubresourceRange{
                                           vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1
                                       });
 
-        vk::ImageMemoryBarrier const barrier2{
-            vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eMemoryRead,
-            vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::ePresentSrcKHR,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            swapchainImage, vk::ImageSubresourceRange{
-                vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1
-            }
-        };
-        commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                                      vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags{}, nullptr, nullptr,
-                                      barrier2);
+        TransitionImageLayout(commandBuffer, swapchainImage,
+                              ImageLayout{
+                                  vk::ImageLayout::eTransferDstOptimal,
+                                  vk::PipelineStageFlagBits2::eTransfer,
+                                  vk::AccessFlagBits2KHR::eTransferWrite,
+                              },
+                              ImageLayout{
+                                  vk::ImageLayout::ePresentSrcKHR,
+                                  vk::PipelineStageFlagBits2::eTransfer,
+                                  vk::AccessFlagBits2KHR::eMemoryRead,
+                              });
 
         commandBuffer.end();
+    }
 
-        vk::SubmitInfo submitInfo{};
-        submitInfo.setCommandBuffers(*commandBuffer);
-        submitInfo.setWaitSemaphores(*imageAvailableSemaphores[0]);
-        submitInfo.setSignalSemaphores(*renderFinishedSemaphores[0]);
-        constexpr vk::PipelineStageFlags waitStage{vk::PipelineStageFlagBits::eTransfer};
-        submitInfo.setWaitDstStageMask(waitStage);
-        graphicsQueue->submit(submitInfo, fence);
+    void BeginFrame(Frame const &frame) {
+        auto _ = device->waitForFences(*frame.fence, VK_TRUE, UINT64_MAX);
+        device->resetFences(*frame.fence);
 
+        auto [acquireResult, imageIndex] = swapchain->
+            acquireNextImage(UINT64_MAX, *frame.imageAvailableSemaphore, nullptr);
+        currentSwapchainImageIndex = imageIndex;
+    }
+
+    void EndFrame(Frame const &frame) {
         vk::PresentInfoKHR presentInfo{};
         presentInfo.setSwapchains(**swapchain);
-        presentInfo.setImageIndices(imageIndex);
-        presentInfo.setWaitSemaphores(*renderFinishedSemaphores[0]);
-        _ = graphicsQueue->presentKHR(presentInfo);
+        presentInfo.setImageIndices(currentSwapchainImageIndex);
+        presentInfo.setWaitSemaphores(*frame.renderFinishedSemaphore);
+        auto _ = graphicsQueue->presentKHR(presentInfo);
+
+        frameIndex = (frameIndex + 1) % IN_FLIGHT_FRAME_COUNT;
+    }
+
+    void SubmitCommandBuffer(Frame const &frame) const {
+        vk::SubmitInfo submitInfo{};
+        submitInfo.setCommandBuffers(*frame.commandBuffer);
+        submitInfo.setWaitSemaphores(*frame.imageAvailableSemaphore);
+        submitInfo.setSignalSemaphores(*frame.renderFinishedSemaphore);
+        constexpr vk::PipelineStageFlags waitStage{vk::PipelineStageFlagBits::eTransfer};
+        submitInfo.setWaitDstStageMask(waitStage);
+        graphicsQueue->submit(submitInfo, frame.fence);
+    }
+
+    void Render() {
+        auto const &frame{*frames[frameIndex]};
+        BeginFrame(frame);
+        RecordCommandBuffer(frame.commandBuffer, swapchainImages[currentSwapchainImageIndex]);
+        SubmitCommandBuffer(frame);
+        EndFrame(frame);
     }
 
     void HandleEvents() {
@@ -189,23 +233,20 @@ private:
         swapchainImages = swapchain->getImages();
     }
 
-    void InitSyncObjects() {
-        vk::FenceCreateInfo fenceCreateInfo{};
-        fenceCreateInfo.flags = vk::FenceCreateFlagBits::eSignaled;
+    void InitFrames() {
+        vk::CommandBufferAllocateInfo commandBufferAllocateInfo{};
+        commandBufferAllocateInfo.commandPool = *commandPool;
+        commandBufferAllocateInfo.level = vk::CommandBufferLevel::ePrimary;
+        commandBufferAllocateInfo.commandBufferCount = IN_FLIGHT_FRAME_COUNT;
+        auto commandBuffers{device->allocateCommandBuffers(commandBufferAllocateInfo)};
 
-        fences.emplace_back(*device, fenceCreateInfo);
-
-        vk::SemaphoreCreateInfo semaphoreCreateInfo{};
-        imageAvailableSemaphores.emplace_back(*device, semaphoreCreateInfo);
-        renderFinishedSemaphores.emplace_back(*device, semaphoreCreateInfo);
-    }
-
-    void AllocateCommandBuffers() {
-        vk::CommandBufferAllocateInfo allocateInfo{};
-        allocateInfo.commandPool = *commandPool;
-        allocateInfo.commandBufferCount = 1;
-
-        commandBuffers = device->allocateCommandBuffers(allocateInfo);
+        for (size_t i = 0; i < IN_FLIGHT_FRAME_COUNT; i++)
+            frames[i].emplace(
+                std::move(commandBuffers[i]),
+                vk::raii::Semaphore{*device, vk::SemaphoreCreateInfo{}},
+                vk::raii::Semaphore{*device, vk::SemaphoreCreateInfo{}},
+                vk::raii::Fence{*device, vk::FenceCreateInfo{vk::FenceCreateFlagBits::eSignaled}}
+            );
     }
 
     void InitCommandPool() {
@@ -228,7 +269,14 @@ private:
         std::array<const char* const, 1> enabledExtensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
         deviceCreateInfo.setPEnabledExtensionNames(enabledExtensions);
 
-        device.emplace(*physicalDevice, deviceCreateInfo);
+        vk::PhysicalDeviceVulkan13Features vulkan13Features{};
+        vulkan13Features.synchronization2 = true;
+
+        vk::StructureChain chain{
+            deviceCreateInfo, vulkan13Features
+        };
+
+        device.emplace(*physicalDevice, chain.get<vk::DeviceCreateInfo>());
 
         graphicsQueue.emplace(*device, graphicsQueueFamilyIndex, 0);
     }
@@ -246,7 +294,7 @@ private:
 
     void InitInstance() {
         vk::ApplicationInfo applicationInfo{};
-        applicationInfo.applicationVersion = VULKAN_VERSION;
+        applicationInfo.apiVersion = VULKAN_VERSION;
 
         vk::InstanceCreateInfo instanceCreateInfo{};
         instanceCreateInfo.pApplicationInfo = &applicationInfo;
